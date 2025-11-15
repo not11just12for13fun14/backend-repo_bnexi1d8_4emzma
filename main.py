@@ -1,14 +1,18 @@
 import os
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Set
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, EmailStr
 
 from database import db, create_document, get_documents
 
-app = FastAPI(title="Nutritionist API", version="0.1.0")
+# OAuth
+from authlib.integrations.starlette_client import OAuth
+
+app = FastAPI(title="Nutritionist API", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -120,11 +124,52 @@ def test_database():
 
 
 # ---------------------
-# Auth (Google - placeholder)
+# Auth (Google via OAuth 2.0)
 # ---------------------
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+
+oauth = OAuth()
+if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
+    oauth.register(
+        name="google",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+        client_kwargs={"scope": "openid email profile"},
+    )
+
+
 @app.get("/auth/google/start")
-def google_auth_start():
-    return {"status": "placeholder", "message": "Google OAuth flow not enabled in this demo."}
+async def google_auth_start(request: Request):
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
+        return {"status": "disabled", "message": "Set GOOGLE_CLIENT_ID/SECRET to enable Google Login."}
+    redirect_uri = f"{BACKEND_URL}/auth/google/callback"
+    return await oauth.google.authorize_redirect(request, redirect_uri)
+
+
+@app.get("/auth/google/callback")
+async def google_auth_callback(request: Request):
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
+        raise HTTPException(status_code=400, detail="Google auth not configured")
+    try:
+        token = await oauth.google.authorize_access_token(request)
+        userinfo = token.get("userinfo") or {}
+        # Upsert user in DB
+        if userinfo.get("email"):
+            _ = create_document("user", {
+                "name": userinfo.get("name", "User"),
+                "email": userinfo["email"],
+                "role": "patient",
+                "avatar_url": userinfo.get("picture")
+            })
+        # In real app, issue a session/JWT. For demo, redirect with minimal data.
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        target = f"{frontend_url}/?name={userinfo.get('name','')}&email={userinfo.get('email','')}"
+        return RedirectResponse(target)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Auth failed: {str(e)[:120]}")
 
 
 # ---------------------
@@ -162,6 +207,47 @@ def get_messages(room: str = "general", limit: int = 50):
         {**{k: (v.isoformat() if hasattr(v, 'isoformat') else v) for k, v in d.items()}, "id": str(d.get("_id"))}
         for d in items
     ]}
+
+
+# ---------------------
+# WebSocket: Rooms for chat/signaling
+# ---------------------
+connections: Dict[str, Set[WebSocket]] = {}
+
+async def _broadcast(room: str, message: str):
+    if room not in connections:
+        return
+    to_remove = []
+    for ws in list(connections[room]):
+        try:
+            await ws.send_text(message)
+        except Exception:
+            to_remove.append(ws)
+    for ws in to_remove:
+        try:
+            connections[room].remove(ws)
+        except Exception:
+            pass
+
+
+@app.websocket("/ws/{room}")
+async def websocket_endpoint(websocket: WebSocket, room: str):
+    await websocket.accept()
+    if room not in connections:
+        connections[room] = set()
+    connections[room].add(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            # Broadcast to room
+            await _broadcast(room, data)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        try:
+            connections[room].remove(websocket)
+        except Exception:
+            pass
 
 
 # ---------------------
